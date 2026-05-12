@@ -12,7 +12,7 @@ If `fast.t-mobile.com` doesn't attach in 2 minutes, try the others.
 
 ## CAT-M / NB-IoT on T-Mobile US
 
-- **CAT-M1 (LTE-M):** broadly deployed on T-Mobile US — primary target for SIM7080G.
+- **CAT-M1 (LTE-M):** broadly deployed on T-Mobile US — primary target for the SIM7000G.
 - **NB-IoT:** very limited US coverage; treat as fallback only.
 - T-Mobile **doesn't** allow CAT-M devices on consumer voice plans in all
   cases — if a consumer SIM refuses to attach in CAT-M mode but works on a

@@ -1,5 +1,10 @@
 # Build Plan
 
+> **Historical document.** This was the original plan targeting the
+> T-SIM7080G-S3. The board that ended up being used is the older
+> T-SIM7000G (different MCU, modem chip, pin map, and AT command quirks).
+> See `STATUS.md` and `README.md` for what was actually built.
+
 ## Phase 0 — Confirm
 
 - [x] Identify board: LilyGo T-SIM7080G-S3 (ESP32-S3 + SIM7080G + Li-Ion)

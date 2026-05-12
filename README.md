@@ -1,76 +1,86 @@
-# LilyGo T-SIM7080G-S3 GPS Tracker
+# LilyGo T-SIM7000G GPS Tracker
 
-End-to-end GPS tracker built on the LilyGo T-SIM7080G-S3 (ESP32-S3 + SIM7080G CAT-M/NB-IoT modem with GNSS, Li-Ion powered), reporting to a self-hosted Traccar dashboard over cellular.
+End-to-end GPS tracker built on the **LilyGo T-SIM7000G** (ESP32-WROVER + SIM7000G CAT-M1 / NB-IoT modem with GNSS, Li-Ion powered), reporting to a self-hosted Traccar dashboard over cellular.
+
+> **Note:** the original `PLAN.md` targets the T-SIM7080G-S3. The board that
+> ended up in this build is the older T-SIM7000G (ESP32-WROVER, no AXP PMU).
+> The two share a similar carrier layout but have different MCU, modem chip,
+> pin map, and AT command quirks. See `STATUS.md` for what changed.
 
 ## Hardware
 
-| Item | Value |
+| | |
 |---|---|
-| Board | LilyGo T-SIM7080G-S3 |
-| MCU | ESP32-S3 (native USB, appears as `/dev/ttyACM0`) |
-| Modem | SIM7080G (CAT-M1 + NB-IoT + GNSS) |
-| Battery | Li-Ion 18650 (on-board holder + charger) |
-| SIM | T-Mobile US |
+| Board | LilyGo T-SIM7000G (ESP32-WROVER variant) |
+| SoC | ESP32 (dual-core Tensilica LX6, 240 MHz, 8 MB PSRAM, 4 MB flash) |
+| Modem | SIM7000G (CAT-M1 + NB-IoT + 2G fallback + GNSS) |
+| Modem FW | `1529B10SIM7000G` — note: B10 has a documented HTTPS bug, see `STATUS.md` |
+| USB bridge | CH9102F → `/dev/ttyACM0` |
+| Power | USB-C + 18650 Li-Ion via JST |
 
-## Stack
-
-- **Firmware:** PlatformIO + Arduino-ESP32 + TinyGSM (`firmware/`)
-- **Server:** Traccar in Docker on VPS (`server/`)
-- **Protocol:** OsmAnd HTTP (Traccar built-in, port 5055) — simplest from modem AT/HTTP
-
-## High-level flow
+## Architecture
 
 ```
-[T-SIM7080G-S3]
-  │  power on modem → attach CAT-M (T-Mobile) → open data context
-  │  poll GNSS until fix
-  │  read VBAT (ADC + divider)
-  │  HTTP GET https://<vps>:5055/?id=<dev-id>&lat=..&lon=..&timestamp=..&speed=..&batt=..
-  │  deep sleep N minutes
-  ▼
-[VPS: Traccar (Docker)]
-  ├─ :5055   OsmAnd ingest
-  └─ :8082   Web UI / API
+[LilyGo T-SIM7000G]
+   │ cellular (T-Mobile CAT-M1, APN fast.t-mobile.com)
+   ▼
+[bore.pub:<port>]                    ← public TCP tunnel, plain HTTP
+   │
+   ▼
+[Pi: `bore local 5055 --to bore.pub` as systemd service]
+   │ localhost
+   ▼
+[Traccar OsmAnd listener :5055]
+   ▼
+[Traccar UI :8082]                   ← Tailscale Funnel exposes this for browsing
 ```
+
+## Why bore and not Tailscale Funnel for tracker ingress?
+
+Funnel only does HTTPS. The SIM7000G's `1529B10` firmware has a documented
+bug in its `+SH*` HTTPS application — `AT+SHCONN` returns "operation not
+allowed" with no software workaround. Plain HTTP via `+HTTPACTION` (with
+`+SAPBR` bearer) works fine. So:
+
+- **Tracker → bore.pub:`<port>` → Pi:5055**  : plain HTTP (modem-compatible)
+- **Browser → `traccar.<tailnet>.ts.net` → Pi:8082** : HTTPS via Tailscale Funnel (browser-compatible)
+
+Two different ingress paths for two different clients.
+
+## Layout
+
+```
+.
+├── README.md           ← you are here
+├── STATUS.md           ← what works / what doesn't, with evidence
+├── PLAN.md             ← original (7080G-S3) plan, kept for reference
+├── firmware/           ← PlatformIO project for the ESP32
+│   ├── platformio.ini
+│   └── src/
+│       ├── main.cpp    ← tracker firmware
+│       └── isrg_der.h  ← Let's Encrypt root CA (unused in current path, kept for future)
+├── server/             ← Pi-side Traccar config
+│   ├── docker-compose.yml
+│   └── traccar.xml     ← with server-side GPS-jump filters enabled
+├── pi-image/           ← cloud-init for the Pi
+│   ├── user-data       ← installs Docker, Traccar, bore, watchdog
+│   ├── network-config  ← Wi-Fi creds (placeholders — fill in your own)
+│   └── meta-data
+└── docs/
+    ├── pinmap.md       ← T-SIM7000G pin map
+    ├── flashing.md     ← uploading the firmware
+    └── tmobile-apn.md  ← T-Mobile APN reference
+```
+
+## Quickstart
+
+Detailed setup in each subdirectory. High-level:
+
+1. **Pi:** flash an SD card with Ubuntu Server + `pi-image/user-data` cloud-init. Pi auto-installs Docker, Traccar, bore, and watchdog on first boot.
+2. **Tunnel:** SSH into the Pi after boot. `sudo journalctl -u bore | grep "listening at"` shows the assigned public port (e.g. `bore.pub:51452`).
+3. **Firmware:** edit `firmware/src/main.cpp` — set `TRACCAR_HOST` (use `dig +short bore.pub` for the IP, more reliable than DNS on the modem) and `TRACCAR_PORT` (the port from step 2). `pio run -t upload`.
+4. **Verify:** open the Traccar UI; `tracker-01` should appear after the first 5-min cycle.
 
 ## Status
 
-- [x] Hardware identified, USB enumerates as ESP32-S3 on `/dev/ttyACM0`
-- [ ] PlatformIO toolchain installed
-- [ ] Firmware scaffolded
-- [ ] Pin map verified against LilyGo reference repo
-- [ ] First flash + serial bring-up
-- [ ] T-Mobile CAT-M attach verified
-- [ ] GNSS fix verified
-- [ ] Traccar receiving positions
-- [ ] Deep sleep + battery profile tuned
-
-## Key decisions
-
-- **OsmAnd over MQTT:** SIM7080G's HTTP AT stack is reliable; OsmAnd protocol is one HTTP GET per fix; no broker to run. We can swap to MQTT later if we need bidirectional control.
-- **Deep sleep, not light sleep:** ESP32-S3 native USB stays attached in light sleep and burns ~mA; deep sleep + RTC wake is what makes Li-Ion endurance reasonable.
-- **APN:** T-Mobile consumer SIM → `fast.t-mobile.com`. T-Mobile IoT SIM → `iot.t-mobile.com`. We'll try `fast.t-mobile.com` first.
-
-## Folder map
-
-```
-lilygo-tracker/
-├── README.md            ← this file
-├── PLAN.md              ← step-by-step build plan + checklist
-├── firmware/            ← PlatformIO project
-│   ├── platformio.ini
-│   └── src/main.cpp
-├── server/              ← VPS-side Traccar deployment
-│   ├── docker-compose.yml
-│   └── traccar.xml
-└── docs/
-    ├── pinmap.md        ← T-SIM7080G-S3 pin reference
-    ├── tmobile-apn.md   ← APN notes + CAT-M caveats
-    └── flashing.md      ← how to flash this board
-```
-
-## Open questions (need from user)
-
-1. VPS hostname / IP for Traccar.
-2. Whether the T-Mobile SIM is a consumer plan or an IoT plan (decides APN).
-3. Reporting interval — default 5 min; faster while moving, slower when stationary?
+Tracker is running, posting every 5 minutes when stationary and every 30 seconds during motion (burst mode), with GPS quality filtering on the device and Traccar server-side filters for crazy-distance protection. See `STATUS.md` for the full breakdown.
