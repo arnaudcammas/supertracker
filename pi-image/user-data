@@ -1,0 +1,91 @@
+#cloud-config
+hostname: traccar
+manage_etc_hosts: true
+
+users:
+  - name: paul
+    groups: [adm, sudo, docker]
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    lock_passwd: true
+    ssh_authorized_keys:
+      - ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDOYbQWhKa5k8TwBa+v9oEth4TWZiGZ190y66ycAQTSC pi@home
+
+ssh_pwauth: false
+disable_root: true
+
+# NOTE: do NOT use cloud-init's `packages:` module — it ran before DNS was ready
+# on first boot and aborted everything. Drive installs from runcmd with retries.
+
+write_files:
+  - path: /opt/traccar/traccar.xml
+    permissions: '0644'
+    content: |
+      <?xml version='1.0' encoding='UTF-8'?>
+      <!DOCTYPE properties SYSTEM 'http://java.sun.com/dtd/properties.dtd'>
+      <properties>
+          <entry key='config.default'>./conf/default.xml</entry>
+          <entry key='database.driver'>org.h2.Driver</entry>
+          <entry key='database.url'>jdbc:h2:./data/database</entry>
+          <entry key='database.user'>sa</entry>
+          <entry key='database.password'></entry>
+          <entry key='web.port'>8082</entry>
+          <entry key='osmand.port'>5055</entry>
+          <entry key='web.registration'>false</entry>
+      </properties>
+
+  - path: /opt/traccar/docker-compose.yml
+    permissions: '0644'
+    content: |
+      services:
+        traccar:
+          image: traccar/traccar:latest
+          container_name: traccar
+          restart: unless-stopped
+          ports:
+            - "8082:8082"
+            - "5055:5055"
+          volumes:
+            - ./data/logs:/opt/traccar/logs
+            - ./data/db:/opt/traccar/data
+            - ./traccar.xml:/opt/traccar/conf/traccar.xml:ro
+
+  - path: /usr/local/sbin/bootstrap-traccar.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      set -e
+      log() { echo "[bootstrap] $*" | tee -a /var/log/bootstrap-traccar.log; }
+
+      # Wait for DNS to actually resolve before touching apt.
+      for i in $(seq 1 60); do
+        if getent hosts archive.ubuntu.com >/dev/null 2>&1; then
+          log "DNS ok"
+          break
+        fi
+        log "waiting for DNS ($i/60)"
+        sleep 5
+      done
+
+      # Retry apt update / install up to 5 times.
+      for i in 1 2 3 4 5; do
+        if apt-get update -y && \
+           DEBIAN_FRONTEND=noninteractive apt-get install -y \
+             docker.io docker-compose-v2 avahi-daemon ca-certificates; then
+          log "apt install ok on attempt $i"
+          break
+        fi
+        log "apt failed (attempt $i), sleeping 30s"
+        sleep 30
+      done
+
+      systemctl enable --now docker
+      systemctl enable --now avahi-daemon
+      mkdir -p /opt/traccar/data/logs /opt/traccar/data/db
+      cd /opt/traccar
+      docker compose pull
+      docker compose up -d
+      log "traccar up: $(docker ps --format '{{.Names}} {{.Status}}')"
+
+runcmd:
+  - [ /usr/local/sbin/bootstrap-traccar.sh ]

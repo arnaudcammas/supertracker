@@ -1,0 +1,13 @@
+firmware/.pio/
+firmware/.vscode/
+server/data/
+*.log
+
+# Local-only files that may contain secrets
+pi-image/network-config.local
+*.secret
+.env*
+
+# Pi image binary (large, downloaded separately)
+pi-image/*.img.xz
+pi-image/*.img
