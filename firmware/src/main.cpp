@@ -5,6 +5,9 @@
 #include <Arduino.h>
 #include <esp_task_wdt.h>
 #include <mbedtls/md.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <HTTPUpdate.h>
 
 #define MODEM_PWRKEY      4
 #define MODEM_TX          27
@@ -23,6 +26,16 @@ static const uint16_t TRACCAR_PORT = 0;
 static const char DEVICE_ID[]      = "tracker-01";
 // Shared secret with the Pi-side HMAC proxy. CHANGE THIS and keep it in sync.
 static const char HMAC_SECRET[]    = "CHANGE_ME_USE_A_LONG_RANDOM_STRING";
+
+// ---- OTA over WiFi (when at home) ----
+// Leave empty strings to disable WiFi OTA entirely. When set, on every wake
+// the firmware briefly tries to join the home WiFi and check for a newer
+// firmware binary. Failures are silent (cellular cycle proceeds normally).
+static const char WIFI_SSID[]      = "";    // e.g. "MyHomeWiFi" — leave empty to disable OTA
+static const char WIFI_PASS[]      = "";
+static const char OTA_URL[]        = "";    // e.g. "http://192.168.1.10:8090/manifest.json"
+static const char OTA_TOKEN[]      = "";    // shared with Pi-side OTA server
+static const uint32_t FW_VERSION   = 1;     // bump this each release. Server returns "version" in manifest.
 
 // Timing
 static const uint32_t STATIONARY_SLEEP_S    = 300;
@@ -174,6 +187,87 @@ static void buildSignedPath(char* outPath, size_t outSize,
 }
 
 // ============================================================
+// OTA over WiFi
+// ============================================================
+// Try to connect to home WiFi briefly. Returns true if associated + IP'd.
+static bool wifiTryConnect(uint32_t timeout_ms = 6000) {
+    if (WIFI_SSID[0] == 0) return false;
+    LOG("[ota] trying WiFi '%s'...\n", WIFI_SSID);
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+    uint32_t deadline = millis() + timeout_ms;
+    while (WiFi.status() != WL_CONNECTED && millis() < deadline) {
+        delay(200);
+        esp_task_wdt_reset();
+    }
+    bool ok = WiFi.status() == WL_CONNECTED;
+    if (ok) LOG("[ota] WiFi up: %s\n", WiFi.localIP().toString().c_str());
+    else    LOG("[ota] WiFi not available\n");
+    return ok;
+}
+
+static void wifiOff() {
+    WiFi.disconnect(true, true);
+    WiFi.mode(WIFI_OFF);
+}
+
+// Check for newer firmware via the OTA manifest. If newer, download and apply.
+// Manifest format (JSON): {"version": <int>, "url": "http://.../firmware.bin"}
+// Both the manifest fetch and binary fetch include "X-OTA-Token" header.
+static void otaCheck() {
+    if (OTA_URL[0] == 0 || OTA_TOKEN[0] == 0) return;
+    if (!wifiTryConnect(6000)) return;
+
+    HTTPClient http;
+    http.setTimeout(8000);
+    if (!http.begin(OTA_URL)) { LOG("[ota] manifest begin fail\n"); wifiOff(); return; }
+    http.addHeader("X-OTA-Token", OTA_TOKEN);
+    int code = http.GET();
+    if (code != 200) {
+        LOG("[ota] manifest HTTP %d\n", code);
+        http.end(); wifiOff(); return;
+    }
+    String body = http.getString();
+    http.end();
+
+    // Crude JSON parse (avoids pulling in ArduinoJson)
+    int vIdx = body.indexOf("\"version\"");
+    int uIdx = body.indexOf("\"url\"");
+    if (vIdx < 0 || uIdx < 0) { LOG("[ota] bad manifest: %s\n", body.c_str()); wifiOff(); return; }
+    int vColon = body.indexOf(':', vIdx);
+    int vEnd   = body.indexOf(',', vColon);
+    if (vEnd < 0) vEnd = body.indexOf('}', vColon);
+    uint32_t serverVer = body.substring(vColon+1, vEnd).toInt();
+
+    int uQuote1 = body.indexOf('"', body.indexOf(':', uIdx));
+    int uQuote2 = body.indexOf('"', uQuote1 + 1);
+    String url = body.substring(uQuote1+1, uQuote2);
+
+    LOG("[ota] local v%u  server v%u  url=%s\n", (unsigned)FW_VERSION, (unsigned)serverVer, url.c_str());
+    if (serverVer <= FW_VERSION) { LOG("[ota] up to date\n"); wifiOff(); return; }
+
+    LOG("[ota] downloading + applying...\n");
+    httpUpdate.setLedPin(BOARD_POWERON, HIGH);   // re-uses our power-on LED as activity indicator
+    httpUpdate.rebootOnUpdate(true);
+    // Long task; pet the watchdog by extending its timeout for this phase
+    esp_task_wdt_reset();
+
+    WiFiClient client;
+    HTTPUpdateResult ret = httpUpdate.update(client, url, "", [](HTTPClient* h){
+        h->addHeader("X-OTA-Token", OTA_TOKEN);
+    });
+    switch (ret) {
+        case HTTP_UPDATE_FAILED:
+            LOG("[ota] FAILED: %s\n", httpUpdate.getLastErrorString().c_str()); break;
+        case HTTP_UPDATE_NO_UPDATES:
+            LOG("[ota] no updates\n"); break;
+        case HTTP_UPDATE_OK:
+            LOG("[ota] success (will not reach here, device reboots)\n"); break;
+    }
+    wifiOff();
+}
+
+// ============================================================
 // Modem power + cycle
 // ============================================================
 static void modemPowerOn() {
@@ -284,6 +378,10 @@ void setup() {
         LOG("[batt] CRITICAL — sleeping %us, skipping cycle\n", (unsigned)CRIT_BATT_SLEEP_S);
         cycleReset(CRIT_BATT_SLEEP_S);
     }
+
+    // Check for OTA update over home WiFi BEFORE powering up the modem.
+    // If new firmware is found, this call reboots the device.
+    otaCheck();
 
     modemPowerOn();
     delay(3000);

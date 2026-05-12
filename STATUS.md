@@ -54,6 +54,28 @@ bore.pub failure mode).
 `filter.future`, `filter.maxSpeed=150 km/h`, `filter.distance=10000 m`,
 `filter.skipLimit=600 s`. Catches anything that the firmware filter misses.
 
+## OTA over WiFi
+
+When the device boots and home WiFi is in range, it briefly associates,
+fetches `http://<pi-lan-ip>:8090/manifest.json` (authenticated via
+`X-OTA-Token`), and compares the server's reported version to the firmware's
+`FW_VERSION`. If newer, the device downloads `firmware.bin` and reboots
+into it via the Arduino `httpUpdate` library (uses ESP32's dual-partition
+scheme for safe A/B updates — failed flashes roll back automatically).
+
+Partition layout switched from `huge_app.csv` (single 3 MB app slot) to
+`default.csv` (two 1.3 MB app slots + 192 KB SPIFFS).
+
+The OTA HTTP server (`server/ota-server.py`) listens on `:8090` on the
+Pi's LAN — **not exposed via bore**, so it isn't internet-reachable.
+Anyone on the LAN with the shared token can push firmware, so the token
+must be kept secret.
+
+To ship a new version: bump `FW_VERSION` in `firmware/src/main.cpp`, then
+run `./release.sh <version>` from the repo root. Builds, copies to Pi,
+bumps `version.txt`, restarts the OTA server. Device picks it up on next
+home-WiFi-reachable boot.
+
 ## Hardening & robustness features
 
 - **HMAC-signed posts** — every request includes `&sig=` (HMAC-SHA256 over

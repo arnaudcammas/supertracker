@@ -1,0 +1,20 @@
+[Unit]
+Description=ESP32 OTA HTTP server (LAN only — do NOT expose via bore)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Set token via drop-in: /etc/systemd/system/ota-server.service.d/token.conf
+# [Service]
+# Environment="OTA_TOKEN=your-real-token-here"
+Environment="OTA_TOKEN=CHANGE_ME"
+Environment="LISTEN_PORT=8090"
+Environment="FW_DIR=/opt/tracker/ota"
+ExecStart=/usr/bin/python3 /opt/tracker/ota-server.py
+Restart=always
+RestartSec=5
+User=paul
+
+[Install]
+WantedBy=multi-user.target

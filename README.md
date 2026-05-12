@@ -103,6 +103,28 @@ Detailed setup in each subdirectory. High-level:
 > `/etc/systemd/system/hmac-proxy.service.d/secret.conf` is also gitignored by
 > default (the path lives outside the repo).
 
+## Updating firmware over WiFi (no USB)
+
+Once the device has been flashed once via USB with `WIFI_SSID`, `WIFI_PASS`,
+`OTA_URL`, and `OTA_TOKEN` set, future updates happen automatically when the
+device boots within home WiFi range:
+
+```bash
+# On the dev machine — bump FW_VERSION in main.cpp first, then:
+./release.sh 2
+```
+
+That builds the new firmware, copies it to the Pi's OTA directory, bumps
+the version, and restarts the OTA server. On the tracker's next cycle, if
+your home WiFi is in range and `serverVersion > FW_VERSION`, the device
+downloads the new image and reboots into it. If WiFi isn't available
+(e.g. on the road), OTA is silently skipped and the cellular cycle proceeds.
+
+The OTA server (`server/ota-server.py`) listens on `:8090` on the Pi LAN
+only — **it is intentionally not exposed via the bore tunnel**. Anyone on
+your LAN with the `X-OTA-Token` header can push firmware to the device, so
+keep the token secret.
+
 ## Status
 
 Tracker is running, posting every 5 minutes when stationary and every 30 seconds during motion (burst mode), with GPS quality filtering on the device and Traccar server-side filters for crazy-distance protection. See `STATUS.md` for the full breakdown.
