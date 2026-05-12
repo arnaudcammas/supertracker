@@ -93,6 +93,23 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         params = parse_qs(parsed.query)
 
+        # Static read-only files in /opt/tracker/static/ (no auth required).
+        # Used for things like HTTPTOFS probes that don't need to be private.
+        if parsed.path.startswith("/static/"):
+            fpath = os.path.join("/opt/tracker/static", os.path.basename(parsed.path))
+            try:
+                size = os.path.getsize(fpath)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Length", str(size))
+                self.end_headers()
+                with open(fpath, "rb") as f:
+                    while chunk := f.read(8192):
+                        self.wfile.write(chunk)
+            except FileNotFoundError:
+                self.send_response(404); self.end_headers()
+            return
+
         ok, reason = _verify_and_record(params)
         if not ok:
             self.send_response(403)

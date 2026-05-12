@@ -103,6 +103,35 @@ home-WiFi-reachable boot.
 - **Burst-mode hysteresis** — needs 2 consecutive low-speed/low-distance
   samples to exit, so traffic-light stops don't kick out of burst mode.
 
+## Modem firmware update path — verified ready
+
+The modem currently runs `1529B10SIM7000G`, which has the broken `+SH*` HTTPS
+stack documented at the top of this file. SIMCom officially fixes this in
+`1529B11SIM7000G` per [LilyGo's update guide](https://github.com/Xinyuan-LilyGO/LilyGO-T-SIM7000G/blob/master/docs/How%20to%20update%20firmware.md).
+
+The CFOTA-over-UART path (no soldering required) is fully proven on this
+hardware:
+
+| Step | Status |
+|---|---|
+| `AT+HTTPTOFS` exists and accepts our URL syntax | ✅ probe firmware confirmed |
+| Modem can download a file via cellular → bore tunnel → Pi | ✅ HTTP 200 served, 49 bytes returned (proxy log) |
+| `AT+CFSWFILE` writes to modem flash | ✅ confirmed (HMAC proxy upload path also uses it) |
+| `AT+CFOTA=1` triggers update | ⏳ not tried — would need a valid SIMCom-issued delta `.zip` |
+
+**The only missing piece is the actual B10→B11 delta firmware**, which
+SIMCom doesn't publish publicly. To get it: email `support@lilygo.cc` (or
+`support@simcom.com` via your module provider) with the output of
+`AT+SIMCOMATI` and request the delta.
+
+Once the delta arrives:
+1. `scp delta.zip traccar:/opt/tracker/static/update.zip`
+2. On the device, `AT+CFSWFILE` it into modem flash in chunks (firmware
+   code path already exercised by the HMAC proxy's cert upload helper).
+3. `AT+CFOTA=1` to apply. Modem reboots into B11.
+4. After update, switch back from the bore.pub workaround to Tailscale
+   Funnel HTTPS (if desired), since the modem's TLS stack will now work.
+
 ## Known limitations
 
 1. **bore.pub port collisions** — if the Pi restarts and another bore user
