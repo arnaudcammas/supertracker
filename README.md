@@ -27,8 +27,11 @@ End-to-end GPS tracker built on the **LilyGo T-SIM7000G** (ESP32-WROVER + SIM700
 [bore.pub:<port>]                    ← public TCP tunnel, plain HTTP
    │
    ▼
-[Pi: `bore local 5055 --to bore.pub` as systemd service]
-   │ localhost
+[Pi: `bore local 5056 --to bore.pub` as systemd service]
+   │ localhost:5056
+   ▼
+[hmac-proxy.py]                      ← verifies HMAC + replay guard
+   │ localhost:5055 (sig stripped before forward)
    ▼
 [Traccar OsmAnd listener :5055]
    ▼
@@ -76,10 +79,29 @@ Two different ingress paths for two different clients.
 
 Detailed setup in each subdirectory. High-level:
 
-1. **Pi:** flash an SD card with Ubuntu Server + `pi-image/user-data` cloud-init. Pi auto-installs Docker, Traccar, bore, and watchdog on first boot.
-2. **Tunnel:** SSH into the Pi after boot. `sudo journalctl -u bore | grep "listening at"` shows the assigned public port (e.g. `bore.pub:51452`).
-3. **Firmware:** edit `firmware/src/main.cpp` — set `TRACCAR_HOST` (use `dig +short bore.pub` for the IP, more reliable than DNS on the modem) and `TRACCAR_PORT` (the port from step 2). `pio run -t upload`.
-4. **Verify:** open the Traccar UI; `tracker-01` should appear after the first 5-min cycle.
+1. **Pi:** flash an SD card with Ubuntu Server + `pi-image/user-data` cloud-init. Auto-installs Docker, Traccar, bore, the HMAC proxy, and watchdog on first boot.
+2. **Pick a shared secret:** `openssl rand -hex 32`. Used to sign tracker posts and verify them on the Pi.
+3. **Configure Pi proxy:**
+   ```bash
+   sudo mkdir -p /etc/systemd/system/hmac-proxy.service.d
+   sudo tee /etc/systemd/system/hmac-proxy.service.d/secret.conf > /dev/null <<EOF
+   [Service]
+   Environment="HMAC_SECRET=$YOUR_SECRET"
+   EOF
+   sudo systemctl daemon-reload && sudo systemctl restart hmac-proxy
+   ```
+4. **Find the bore port:** `sudo journalctl -u bore | grep "listening at"` (e.g. `bore.pub:51452`).
+5. **Firmware:** edit `firmware/src/main.cpp`:
+   - `TRACCAR_HOST` — `dig +short bore.pub` for the IP (more reliable than DNS on the modem)
+   - `TRACCAR_PORT` — port from step 4
+   - `HMAC_SECRET` — same string from step 2
+6. `cd firmware && pio run -t upload`.
+7. **Verify:** Traccar UI shows `tracker-01` after the first cycle. Posts without a valid signature get `403 forbidden` in the proxy logs (`journalctl -u hmac-proxy`).
+
+> ⚠️ Don't commit your real `HMAC_SECRET` to a public repo. Leave the placeholder
+> in `main.cpp` and patch it locally before flashing. The Pi-side secret in
+> `/etc/systemd/system/hmac-proxy.service.d/secret.conf` is also gitignored by
+> default (the path lives outside the repo).
 
 ## Status
 

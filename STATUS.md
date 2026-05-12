@@ -54,13 +54,41 @@ bore.pub failure mode).
 `filter.future`, `filter.maxSpeed=150 km/h`, `filter.distance=10000 m`,
 `filter.skipLimit=600 s`. Catches anything that the firmware filter misses.
 
+## Hardening & robustness features
+
+- **HMAC-signed posts** — every request includes `&sig=` (HMAC-SHA256 over
+  `id|lat|lon|boot|fixes`, truncated to 16 hex). The Pi runs `hmac-proxy.py`
+  in front of Traccar; bad signatures get 403. Without the shared secret an
+  attacker who finds the bore endpoint can't spoof the device.
+- **Replay guard** — the proxy persists `(boot, fixes)` per device id and
+  rejects any tuple it has already seen. Captured posts can't be replayed.
+- **Retry-once on HTTP failure** — transient cellular hiccups no longer
+  cost a whole post cycle.
+- **Modem soft-reset** — after 2 consecutive failed posts, the firmware
+  issues `AT+CFUN=0; AT+CFUN=1` on next wake to unwedge the radio. Fixes
+  the "device goes silent for 14 minutes" failure mode we used to see.
+- **Task watchdog** — `esp_task_wdt` set to 4 min. If any phase hangs
+  (modem AT timeout, GPS poll, HTTP stuck), the ESP32 reboots instead of
+  sitting awake draining battery.
+- **Adaptive sleep** — `<3.45 V` → sleep 30 min; `<3.20 V` → sleep 6 h.
+  Protects the cell from over-discharge.
+- **Bore tunnel watchdog** — cron on the Pi probes `bore.pub:<port>` every
+  2 min and restarts the bore client if the public proxy goes stale (a
+  known bore.pub failure mode).
+- **GPS quality filter** — drops fixes with HDOP > 5 or sats < 4 before
+  posting; Traccar server-side filters drop any speed/distance jumps that
+  slip through.
+- **Burst-mode hysteresis** — needs 2 consecutive low-speed/low-distance
+  samples to exit, so traffic-light stops don't kick out of burst mode.
+
 ## Known limitations
 
-1. **bore.pub port collisions**: if the Pi restarts and someone else grabs
-   your bore port in the brief window, you'd need to reflash with the new
-   port. Probability is low (random 16-bit port) but non-zero. Bulletproof
-   fix is self-hosting bore on a free VPS.
-2. **No encryption**: the cellular → bore → Pi path is plain HTTP. Anyone
-   who knows the public endpoint can spoof posts with your device ID.
-   Fine for personal use, not for anything sensitive.
-3. **Modem firmware bug** is the root cause — see top of this file.
+1. **bore.pub port collisions** — if the Pi restarts and another bore user
+   grabs your port in the brief window, you'd need to reflash with the new
+   port. Probability is low (random 16-bit port). Bulletproof fix is
+   self-hosting bore on a free VPS.
+2. **Plain HTTP on the wire** — the tunnel is unencrypted between modem
+   and Pi. HMAC prevents spoofing, but lat/lon/etc are visible to anyone
+   between you and bore.pub (cellular MITM is rare but theoretically possible).
+3. **Modem firmware bug** is the root cause for not using TLS — see top of
+   this file.

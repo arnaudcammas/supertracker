@@ -1,0 +1,22 @@
+[Unit]
+Description=HMAC-verifying reverse proxy for tracker → Traccar
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Override secret via systemd drop-in: /etc/systemd/system/hmac-proxy.service.d/secret.conf
+# [Service]
+# Environment="HMAC_SECRET=your-real-secret-here"
+Environment="HMAC_SECRET=CHANGE_ME_USE_A_LONG_RANDOM_STRING"
+Environment="LISTEN_PORT=5056"
+Environment="TRACCAR_URL=http://localhost:5055"
+Environment="STATE_FILE=/var/lib/hmac-proxy/seen.json"
+ExecStart=/usr/bin/python3 /opt/tracker/hmac-proxy.py
+Restart=always
+RestartSec=5
+User=paul
+StateDirectory=hmac-proxy
+
+[Install]
+WantedBy=multi-user.target
