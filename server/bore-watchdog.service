@@ -1,0 +1,8 @@
+[Unit]
+Description=Probe bore.pub tunnel and restart bore if wedged
+After=network-online.target bore.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/bore-watchdog.sh

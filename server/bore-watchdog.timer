@@ -1,0 +1,11 @@
+[Unit]
+Description=Run bore-watchdog every 2 minutes
+
+[Timer]
+OnBootSec=120
+OnUnitActiveSec=120
+AccuracySec=10s
+Unit=bore-watchdog.service
+
+[Install]
+WantedBy=timers.target
