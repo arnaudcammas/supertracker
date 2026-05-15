@@ -7,6 +7,7 @@ server/data/
 pi-image/network-config.local
 *.secret
 .env*
+firmware/src/secrets.h
 
 # Pi image binary (large, downloaded separately)
 pi-image/*.img.xz

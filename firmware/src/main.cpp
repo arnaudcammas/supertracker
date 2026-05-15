@@ -8,6 +8,8 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <HTTPUpdate.h>
+#include <LittleFS.h>
+#include "secrets.h"  // defines TRACCAR_HOST and HMAC_SECRET; gitignored
 
 #define MODEM_PWRKEY      4
 #define MODEM_TX          27
@@ -19,13 +21,10 @@
 
 // ---- USER CONFIG ----
 static const char APN[]            = "fast.t-mobile.com";
-// Run `bore local 5056 --to bore.pub --port <YOUR_PORT>` on your Pi.
-// Use the IP from `dig +short bore.pub` to skip DNS on the modem.
-static const char TRACCAR_HOST[]   = "BORE_PUB_IP";
-static const uint16_t TRACCAR_PORT = 0;
+// TRACCAR_HOST and HMAC_SECRET live in secrets.h (gitignored).
+// See secrets.example.h for the template.
+static const uint16_t TRACCAR_PORT = 51452;
 static const char DEVICE_ID[]      = "tracker-01";
-// Shared secret with the Pi-side HMAC proxy. CHANGE THIS and keep it in sync.
-static const char HMAC_SECRET[]    = "CHANGE_ME_USE_A_LONG_RANDOM_STRING";
 
 // ---- OTA over WiFi (when at home) ----
 // Leave empty strings to disable WiFi OTA entirely. When set, on every wake
@@ -35,7 +34,7 @@ static const char WIFI_SSID[]      = "";    // e.g. "MyHomeWiFi" — leave empty
 static const char WIFI_PASS[]      = "";
 static const char OTA_URL[]        = "";    // e.g. "http://192.168.1.10:8090/manifest.json"
 static const char OTA_TOKEN[]      = "";    // shared with Pi-side OTA server
-static const uint32_t FW_VERSION   = 1;     // bump this each release. Server returns "version" in manifest.
+static const uint32_t FW_VERSION   = 2;     // bump this each release. Server returns "version" in manifest.
 
 // Timing
 static const uint32_t STATIONARY_SLEEP_S    = 300;
@@ -342,6 +341,129 @@ static int httpGet(const char* path) {
 }
 
 // ============================================================
+// Offline store-and-forward queue (LittleFS)
+//
+// Each line is one fully-built, HMAC-signed request path. The signature has
+// no timestamp, so a buffered path stays valid indefinitely, and the server's
+// (boot,fixes) replay guard makes re-sending a record harmless. Records are
+// appended in fixes-increasing order and always flushed oldest-first, so the
+// server sees a monotonic sequence even after an offline stretch.
+// ============================================================
+static const char   QUEUE_FN[]      = "/q.log";
+static const char   QUEUE_TMP[]     = "/q.tmp";
+static const size_t MAX_QUEUE_BYTES = 400000;   // ~1200 records; SPIFFS partition is ~1.5 MB
+static bool         fsReady         = false;
+
+static void queueInit() {
+    fsReady = LittleFS.begin(true);   // format on first boot / corruption
+    if (!fsReady) { LOG("[queue] LittleFS mount FAILED — buffering disabled\n"); return; }
+    size_t n = 0;
+    File f = LittleFS.open(QUEUE_FN, "r");
+    if (f) { n = f.size(); f.close(); }
+    LOG("[queue] ready, %u bytes pending\n", (unsigned)n);
+}
+
+// Monotonic boot counter persisted to flash. RTC RAM alone is wiped on power
+// loss, which would send the server's replay guard backwards and lock us out.
+static const char BOOTCNT_FN[] = "/boot.cnt";
+static uint32_t bumpBootCount() {
+    uint32_t n = 0;
+    if (fsReady) {
+        File f = LittleFS.open(BOOTCNT_FN, "r");
+        if (f) { n = (uint32_t)f.readString().toInt(); f.close(); }
+    }
+    n++;
+    if (fsReady) {
+        File f = LittleFS.open(BOOTCNT_FN, "w");
+        if (f) { f.print(n); f.close(); }
+    }
+    LOG("[boot] persistent boot count = %u\n", (unsigned)n);
+    return n;
+}
+
+static void queueAppend(const char* path) {
+    if (!fsReady) return;
+    File f = LittleFS.open(QUEUE_FN, "a");
+    if (!f) { LOG("[queue] append failed to open\n"); return; }
+    if (f.size() > MAX_QUEUE_BYTES) {
+        LOG("[queue] FULL (%u B) — dropping this fix\n", (unsigned)f.size());
+        f.close();
+        return;
+    }
+    f.println(path);
+    size_t n = f.size();
+    f.close();
+    LOG("[queue] buffered fix (%u B pending)\n", (unsigned)n);
+}
+
+// Send queued fixes oldest-first. Stops at the first transient failure and
+// keeps that record plus all newer ones. A 403 (replay / bad sig) can never
+// succeed on retry, so it is dropped. Returns true if the queue is now empty.
+static bool queueFlush() {
+    if (!fsReady) return true;
+    if (!LittleFS.exists(QUEUE_FN)) return true;
+    File in = LittleFS.open(QUEUE_FN, "r");
+    if (!in) return true;
+    if (in.size() == 0) { in.close(); LittleFS.remove(QUEUE_FN); return true; }
+
+    LOG("[queue] flushing %u bytes...\n", (unsigned)in.size());
+    int sent = 0, dropped = 0;
+    bool stalled = false;
+    File out;
+
+    while (in.available()) {
+        esp_task_wdt_reset();
+        String line = in.readStringUntil('\n');
+        line.trim();
+        if (line.length() == 0) continue;
+
+        if (!stalled) {
+            int code = httpGet(line.c_str());
+            if (code >= 200 && code < 300) { sent++; continue; }
+            if (code == 403)               { dropped++; continue; }
+            stalled = true;
+            out = LittleFS.open(QUEUE_TMP, "w");
+            if (!out) {                       // can't stage remainder — leave queue intact
+                in.close();
+                LOG("[queue] temp open failed — keeping queue as-is\n");
+                return false;
+            }
+        }
+        out.println(line);
+    }
+    in.close();
+
+    if (stalled) {
+        out.close();
+        LittleFS.remove(QUEUE_FN);
+        LittleFS.rename(QUEUE_TMP, QUEUE_FN);
+        size_t rem = 0;
+        File q = LittleFS.open(QUEUE_FN, "r");
+        if (q) { rem = q.size(); q.close(); }
+        LOG("[queue] sent %d, dropped %d, %u B still pending\n", sent, dropped, (unsigned)rem);
+        return false;
+    }
+    LittleFS.remove(QUEUE_FN);
+    LOG("[queue] sent %d, dropped %d, queue empty\n", sent, dropped);
+    return true;
+}
+
+// Flush any backlog, then send `path`. If `enqueueOnFail` and `path` is not
+// delivered (and not permanently rejected), it is buffered for a later cycle.
+// Returns true only if `path` itself was delivered (2xx) on this call.
+static bool sendWithQueue(const char* path, bool enqueueOnFail) {
+    bool drained = queueFlush();
+    if (!drained) {
+        if (enqueueOnFail) queueAppend(path);   // keep ordering: behind the backlog
+        return false;
+    }
+    int code = httpGet(path);
+    bool ok = (code >= 200 && code < 300);
+    if (!ok && enqueueOnFail && code != 403) queueAppend(path);
+    return ok;
+}
+
+// ============================================================
 // Setup
 // ============================================================
 void setup() {
@@ -357,13 +479,22 @@ void setup() {
         rtc.consecutiveFails = 0;
         rtc.burstWasStopped = false;
     }
-    rtc.boots++;
+    queueInit();   // mount LittleFS — needed for the queue AND the boot counter
+
+    // The boot counter feeds the server's replay guard, which demands a
+    // strictly-increasing (boot,fixes). RTC RAM resets to 0 on every power
+    // loss (no battery = every unplug), so persist it to flash instead.
+    rtc.boots = bumpBootCount();
     LOG("[boot] wake #%u  cachedFixes=%u  consecutiveFails=%u\n",
         (unsigned)rtc.boots,
         rtc.magic == RTC_MAGIC ? (unsigned)rtc.fixes : 0u,
         (unsigned)rtc.consecutiveFails);
 
-    // Battery / solar
+    // Battery / solar — the divider network is unpowered until BOARD_POWERON
+    // is HIGH; reading before that floats both ADCs to the same bogus ~0.28 V.
+    pinMode(BOARD_POWERON, OUTPUT);
+    digitalWrite(BOARD_POWERON, HIGH);
+    delay(500);
     analogReadResolution(12);
     float vbat = readDividerV(BAT_ADC);
     float vsol = readDividerV(SOLAR_ADC);
@@ -470,24 +601,26 @@ void setup() {
 
     esp_task_wdt_reset();
 
-    // POST — signed
+    // POST — signed. Real fixes go through the offline queue (buffered to
+    // flash and retried on a later cycle if the send fails); heartbeats are
+    // best-effort but still trigger a flush so any backlog drains once we're up.
     char path[512];
-    int postCode = -1;
+    bool delivered;
     if (gotFix) {
         buildSignedPath(path, sizeof(path), lat, lon, speed, 1,
                         pct, vbat, vsol, charging, hdop, sats, csq);
-        postCode = httpGet(path);
+        delivered = sendWithQueue(path, true);
     } else if (rtc.magic == RTC_MAGIC) {
         buildSignedPath(path, sizeof(path), rtc.lat, rtc.lon, 0.0f, 0,
                         pct, vbat, vsol, charging, 99.0f, 0, csq);
-        postCode = httpGet(path);
+        delivered = sendWithQueue(path, false);
     } else {
         buildSignedPath(path, sizeof(path), 0.0f, 0.0f, 0.0f, 0,
                         pct, vbat, vsol, charging, 99.0f, 0, csq);
-        postCode = httpGet(path);
+        delivered = sendWithQueue(path, false);
     }
 
-    if (postCode >= 200 && postCode < 300) {
+    if (delivered) {
         rtc.consecutiveFails = 0;
     } else {
         rtc.consecutiveFails++;
@@ -535,8 +668,8 @@ void setup() {
                 int bcsq = readCSQ();
                 char p2[512];
                 buildSignedPath(p2, sizeof(p2), bl, bn, bs, 1, pp, vb, vsol, charging, bh, bsats, bcsq);
-                int bc = httpGet(p2);
-                if (bc >= 200 && bc < 300) rtc.consecutiveFails = 0;
+                bool bdelivered = sendWithQueue(p2, true);
+                if (bdelivered) rtc.consecutiveFails = 0;
                 else rtc.consecutiveFails++;
                 // Hysteresis: only exit burst after TWO consecutive low samples
                 bool low = (bs < MOTION_SPEED_KMH && dist < MOTION_DIST_M);
