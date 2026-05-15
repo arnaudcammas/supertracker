@@ -1,130 +1,167 @@
-# LilyGo T-SIM7000G GPS Tracker
+# supertracker
 
-End-to-end GPS tracker built on the **LilyGo T-SIM7000G** (ESP32-WROVER + SIM7000G CAT-M1 / NB-IoT modem with GNSS, Li-Ion powered), reporting to a self-hosted Traccar dashboard over cellular.
+A bike-tracker that should not exist. An ESP32 glued to a cellular modem,
+yelling its GPS coordinates at the open internet, which a Raspberry Pi
+in my house then catches and feeds to a self-hosted dashboard.
 
-> **Note:** the original `PLAN.md` targets the T-SIM7080G-S3. The board that
-> ended up in this build is the older T-SIM7000G (ESP32-WROVER, no AXP PMU).
-> The two share a similar carrier layout but have different MCU, modem chip,
-> pin map, and AT command quirks. See `STATUS.md` for what changed.
+It runs on solar. It sleeps when nobody's riding. It survives power loss.
+It does HTTP because the modem's HTTPS stack is haunted.
+
+## What it does
+
+```
+   🚲 [LilyGo T-SIM7000G]
+       │  cellular (T-Mobile, plain HTTP, HMAC-signed)
+       ▼
+   ☁️  bore.pub:<port>                ← free public TCP tunnel
+       │
+       ▼
+   🥧 Raspberry Pi at home
+       ├─ bore   (catches the tunnel)
+       ├─ hmac-proxy.py  (checks the signature, drops impostors)
+       └─ Traccar  (the actual dashboard)
+       │
+       ▼
+   💻 Browser → traccar.<your-tailnet>.ts.net  (Tailscale Funnel, HTTPS)
+```
+
+Two ingress paths because the tracker speaks HTTP and browsers speak
+HTTPS, and forcing either one to switch was more pain than running two
+tunnels.
+
+## Why HTTP and not HTTPS for the tracker?
+
+Because the SIM7000G's `1529B10` firmware has a known bug in its HTTPS
+stack — `AT+SHCONN` returns "operation not allowed" with no workaround
+short of reflashing the modem itself (lol no). Plain HTTP via
+`+HTTPACTION` works fine. So instead of fighting the modem, we sign
+every request with HMAC-SHA256 and let the Pi verify it. Same end
+result, fewer tears.
 
 ## Hardware
 
 | | |
 |---|---|
-| Board | LilyGo T-SIM7000G (ESP32-WROVER variant) |
-| SoC | ESP32 (dual-core Tensilica LX6, 240 MHz, 8 MB PSRAM, 4 MB flash) |
-| Modem | SIM7000G (CAT-M1 + NB-IoT + 2G fallback + GNSS) |
-| Modem FW | `1529B10SIM7000G` — note: B10 has a documented HTTPS bug, see `STATUS.md` |
-| USB bridge | CH9102F → `/dev/ttyACM0` |
-| Power | USB-C + 18650 Li-Ion via JST |
+| Board | LilyGo T-SIM7000G — yes the *old* one, not the 7080G-S3 |
+| Brain | ESP32-WROVER (240 MHz, 8 MB PSRAM, 4 MB flash) |
+| Radio | SIM7000G — CAT-M1 / NB-IoT / 2G fallback, plus GNSS |
+| USB   | CH9102F → `/dev/ttyACM0` |
+| Power | 18650 Li-Ion via JST + USB-C + a tiny solar panel |
 
-## Architecture
+> The original `PLAN.md` was for the T-SIM7080G-S3. The board that
+> showed up in the mail was the T-SIM7000G. Same family, different
+> pinout, different AT commands, different bugs. `STATUS.md` has the
+> autopsy.
 
-```
-[LilyGo T-SIM7000G]
-   │ cellular (T-Mobile CAT-M1, APN fast.t-mobile.com)
-   ▼
-[bore.pub:<port>]                    ← public TCP tunnel, plain HTTP
-   │
-   ▼
-[Pi: `bore local 5056 --to bore.pub` as systemd service]
-   │ localhost:5056
-   ▼
-[hmac-proxy.py]                      ← verifies HMAC + replay guard
-   │ localhost:5055 (sig stripped before forward)
-   ▼
-[Traccar OsmAnd listener :5055]
-   ▼
-[Traccar UI :8082]                   ← Tailscale Funnel exposes this for browsing
-```
-
-## Why bore and not Tailscale Funnel for tracker ingress?
-
-Funnel only does HTTPS. The SIM7000G's `1529B10` firmware has a documented
-bug in its `+SH*` HTTPS application — `AT+SHCONN` returns "operation not
-allowed" with no software workaround. Plain HTTP via `+HTTPACTION` (with
-`+SAPBR` bearer) works fine. So:
-
-- **Tracker → bore.pub:`<port>` → Pi:5055**  : plain HTTP (modem-compatible)
-- **Browser → `traccar.<tailnet>.ts.net` → Pi:8082** : HTTPS via Tailscale Funnel (browser-compatible)
-
-Two different ingress paths for two different clients.
-
-## Layout
+## Repo layout
 
 ```
 .
-├── README.md           ← you are here
-├── STATUS.md           ← what works / what doesn't, with evidence
-├── PLAN.md             ← original (7080G-S3) plan, kept for reference
-├── firmware/           ← PlatformIO project for the ESP32
-│   ├── platformio.ini
+├── README.md        ← hi
+├── STATUS.md        ← what works, what doesn't, with receipts
+├── PLAN.md          ← original plan (wrong board, kept for history)
+├── firmware/        ← PlatformIO project for the ESP32
 │   └── src/
-│       ├── main.cpp    ← tracker firmware
-│       └── isrg_der.h  ← Let's Encrypt root CA (unused in current path, kept for future)
-├── server/             ← Pi-side Traccar config
-│   ├── docker-compose.yml
-│   └── traccar.xml     ← with server-side GPS-jump filters enabled
-├── pi-image/           ← cloud-init for the Pi
-│   ├── user-data       ← installs Docker, Traccar, bore, watchdog
-│   ├── network-config  ← Wi-Fi creds (placeholders — fill in your own)
-│   └── meta-data
-└── docs/
-    ├── pinmap.md       ← T-SIM7000G pin map
-    ├── flashing.md     ← uploading the firmware
-    └── tmobile-apn.md  ← T-Mobile APN reference
+│       ├── main.cpp
+│       ├── secrets.example.h   ← copy → secrets.h, fill in
+│       └── secrets.h           ← gitignored, your real values live here
+├── server/          ← Traccar + docker-compose for the Pi
+├── pi-image/        ← cloud-init: hand the Pi an SD card and walk away
+└── docs/            ← pinmap, flashing notes, T-Mobile APN cheatsheet
 ```
 
 ## Quickstart
 
-Detailed setup in each subdirectory. High-level:
+You will need: the LilyGo board, a Raspberry Pi, a SIM with data, a 
+shared secret, and roughly one afternoon.
 
-1. **Pi:** flash an SD card with Ubuntu Server + `pi-image/user-data` cloud-init. Auto-installs Docker, Traccar, bore, the HMAC proxy, and watchdog on first boot.
-2. **Pick a shared secret:** `openssl rand -hex 32`. Used to sign tracker posts and verify them on the Pi.
-3. **Configure Pi proxy:**
-   ```bash
-   sudo mkdir -p /etc/systemd/system/hmac-proxy.service.d
-   sudo tee /etc/systemd/system/hmac-proxy.service.d/secret.conf > /dev/null <<EOF
-   [Service]
-   Environment="HMAC_SECRET=$YOUR_SECRET"
-   EOF
-   sudo systemctl daemon-reload && sudo systemctl restart hmac-proxy
-   ```
-4. **Find the bore port:** `sudo journalctl -u bore | grep "listening at"` (e.g. `bore.pub:51452`).
-5. **Firmware:** edit `firmware/src/main.cpp`:
-   - `TRACCAR_HOST` — `dig +short bore.pub` for the IP (more reliable than DNS on the modem)
-   - `TRACCAR_PORT` — port from step 4
-   - `HMAC_SECRET` — same string from step 2
-6. `cd firmware && pio run -t upload`.
-7. **Verify:** Traccar UI shows `tracker-01` after the first cycle. Posts without a valid signature get `403 forbidden` in the proxy logs (`journalctl -u hmac-proxy`).
+**1. Bake the Pi.** Flash an SD card with Ubuntu Server + `pi-image/user-data`.
+Boot it once. Cloud-init installs Docker, Traccar, bore, the HMAC proxy,
+and the watchdog. Go make a sandwich.
 
-> ⚠️ Don't commit your real `HMAC_SECRET` to a public repo. Leave the placeholder
-> in `main.cpp` and patch it locally before flashing. The Pi-side secret in
-> `/etc/systemd/system/hmac-proxy.service.d/secret.conf` is also gitignored by
-> default (the path lives outside the repo).
-
-## Updating firmware over WiFi (no USB)
-
-Once the device has been flashed once via USB with `WIFI_SSID`, `WIFI_PASS`,
-`OTA_URL`, and `OTA_TOKEN` set, future updates happen automatically when the
-device boots within home WiFi range:
+**2. Pick a secret.**
 
 ```bash
-# On the dev machine — bump FW_VERSION in main.cpp first, then:
+openssl rand -hex 32
+```
+
+Same string goes in two places: the Pi (so it can verify) and the
+firmware (so it can sign).
+
+**3. Tell the Pi the secret:**
+
+```bash
+sudo mkdir -p /etc/systemd/system/hmac-proxy.service.d
+sudo tee /etc/systemd/system/hmac-proxy.service.d/secret.conf > /dev/null <<EOF
+[Service]
+Environment="HMAC_SECRET=$YOUR_SECRET"
+EOF
+sudo systemctl daemon-reload && sudo systemctl restart hmac-proxy
+```
+
+**4. Find the bore port:**
+
+```bash
+sudo journalctl -u bore | grep "listening at"
+# bore.pub:51452 → that's the port
+```
+
+**5. Tell the firmware the secret:**
+
+```bash
+cp firmware/src/secrets.example.h firmware/src/secrets.h
+```
+
+Edit `secrets.h`:
+- `TRACCAR_HOST` — run `dig +short bore.pub`, paste the IP. (DNS on the
+  modem is flaky; an IP literal Just Works.)
+- `HMAC_SECRET` — paste the same string from step 2.
+
+Then in `firmware/src/main.cpp`, set `TRACCAR_PORT` to whatever bore
+gave you in step 4.
+
+> `secrets.h` is `.gitignored`. Don't try to outsmart it — the whole
+> point of HMAC is undone if the secret leaks.
+
+**6. Flash:**
+
+```bash
+cd firmware && pio run -t upload
+```
+
+**7. Wait one cycle.** Traccar UI should show `tracker-01` within a
+minute or so. If something's wrong, `journalctl -u hmac-proxy` on the
+Pi will tell you (`403` = bad signature, usually a typo in the secret).
+
+## OTA updates (no USB needed)
+
+After the first USB flash, set `WIFI_SSID`, `WIFI_PASS`, `OTA_URL`, and
+`OTA_TOKEN` in `main.cpp` and you can ship new firmware over your home
+WiFi. Bump `FW_VERSION` in `main.cpp`, then:
+
+```bash
 ./release.sh 2
 ```
 
-That builds the new firmware, copies it to the Pi's OTA directory, bumps
-the version, and restarts the OTA server. On the tracker's next cycle, if
-your home WiFi is in range and `serverVersion > FW_VERSION`, the device
-downloads the new image and reboots into it. If WiFi isn't available
-(e.g. on the road), OTA is silently skipped and the cellular cycle proceeds.
+That builds, copies the binary to the Pi's OTA directory, and bumps the
+manifest. Next time the tracker wakes up in WiFi range, it'll grab the
+new image and reboot into it. Out on the road? OTA quietly skips and
+cellular carries on.
 
-The OTA server (`server/ota-server.py`) listens on `:8090` on the Pi LAN
-only — **it is intentionally not exposed via the bore tunnel**. Anyone on
-your LAN with the `X-OTA-Token` header can push firmware to the device, so
-keep the token secret.
+The OTA server (`server/ota-server.py`) only listens on the Pi's LAN —
+**deliberately not** exposed through bore. Anyone on your LAN holding
+the `X-OTA-Token` can push firmware. Keep it secret, keep it safe.
 
 ## Status
 
-Tracker is running, posting every 5 minutes when stationary and every 30 seconds during motion (burst mode), with GPS quality filtering on the device and Traccar server-side filters for crazy-distance protection. See `STATUS.md` for the full breakdown.
+It's posting. Every 5 minutes when parked, every 30 seconds when moving
+(burst mode), with GPS quality filtering on the device and sanity
+filters on Traccar so it doesn't draw a 200-mile teleport every time
+the GPS hiccups.
+
+Also: if cellular drops, fixes get buffered to flash and flushed when
+the connection comes back. Boot counter is persisted too, so the HMAC
+replay guard survives a power loss without the device locking itself
+out.
+
+Full warts-and-all writeup in `STATUS.md`.
